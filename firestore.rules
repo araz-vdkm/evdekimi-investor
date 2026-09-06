@@ -1,0 +1,25 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isAdmin() {
+      return request.auth != null && request.auth.token.email == 'roman@evdekimi.com';
+    }
+    match /user_accounts/{docId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    
+    match /account_links/{docId} {
+      allow read: if isAdmin() || (request.auth != null && request.auth.token.email == docId);
+      allow write: if isAdmin() || (request.auth != null && request.auth.token.email == docId);
+    }
+    
+    match /monthly_reports/{docId} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

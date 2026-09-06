@@ -1,0 +1,8 @@
+{
+  "name": "Remix: EVDEkimi Property Dashboard",
+  "description": "High-fidelity financial performance and property management dashboard with Guesty API simulation and dual-currency support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

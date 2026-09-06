@@ -1,0 +1,43 @@
+{
+  "entities": {
+    "userProfile": {
+      "title": "User Profile",
+      "description": "User account information and roles.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "User email address"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["investor", "admin"],
+          "description": "System role"
+        }
+      },
+      "required": ["email", "role"]
+    },
+    "integrationConfig": {
+      "title": "Integration Config",
+      "description": "API integration parameters.",
+      "type": "object",
+      "properties": {
+        "clientId": { "type": "string" },
+        "clientSecret": { "type": "string" },
+        "webhookUrl": { "type": "string" },
+        "syncInterval": { "type": "string" }
+      }
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "userProfile",
+      "description": "User profiles"
+    },
+    "/configs/guesty": {
+      "schema": "integrationConfig",
+      "description": "Global guesty integration config"
+    }
+  }
+}
