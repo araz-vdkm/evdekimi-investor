@@ -20,56 +20,136 @@ const firebaseConfig = JSON.parse(fs.readFileSync('./firebase-applet-config.json
 const DB_PATH = path.join(process.cwd(), 'data', 'google-mappings.json');
 const BOOKINGS_DB_PATH = path.join(process.cwd(), 'data', 'evdekimi-bookings.json');
 
+/** In-memory copy of the last successful reservations fetch.
+ *
+ *  The file cache below lives on the container's own disk, which on Cloud Run
+ *  is per-instance and thrown away on every deploy: an instance that has not
+ *  synced yet has no file, so a request landing there used to get a 503 while
+ *  a sibling instance served data happily. Keeping the payload in memory as
+ *  well, and being willing to fetch on demand, makes any instance able to
+ *  answer from its first request. */
+let evdekimiMemoryCache: { fetchedAt: number; data: any } | null = null;
+
+/** How long a fetched payload is reused before going back to the API. The
+ *  scheduled sync still runs every two hours; this bounds how stale an
+ *  on-demand answer can be, and stops a burst of requests on a cold instance
+ *  from each calling upstream. */
+const EVDEKIMI_CACHE_TTL_MS = 15 * 60 * 1000;
+
+/** One in-flight fetch is shared by every caller waiting on it, so a cold
+ *  instance receiving several requests at once hits the API once. */
+let evdekimiInFlight: Promise<any> | null = null;
+
+function evdekimiDateRange() {
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const fromDateObj = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const toDateObj = new Date(now.getFullYear(), now.getMonth() + 4, 0);
+  return {
+    fromDate: `${fromDateObj.getFullYear()}-${pad(fromDateObj.getMonth() + 1)}-01`,
+    toDate: `${toDateObj.getFullYear()}-${pad(toDateObj.getMonth() + 1)}-${pad(toDateObj.getDate())}`,
+  };
+}
+
+/** Fetches reservations from the Evdekimi (hospara) API. Throws with a
+ *  message worth logging - the upstream answers plain text on some errors,
+ *  so the body is surfaced rather than a bare "invalid JSON". */
+async function fetchEvdekimiFromApi(): Promise<any> {
+  const apiKey = process.env.EVDEKIMI_API_KEY;
+  if (!apiKey) throw new Error('EVDEKIMI_API_KEY is not configured');
+
+  const { fromDate, toDate } = evdekimiDateRange();
+  const url = `https://evdekimi.hospara.workers.dev/v1/reservations?from=${fromDate}&to=${toDate}`;
+  const response = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` } });
+  const text = await response.text();
+
+  let data: any;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Evdekimi API returned non-JSON (HTTP ${response.status}): ${text.slice(0, 200)}`);
+  }
+  if (!response.ok) {
+    throw new Error(`Evdekimi API returned HTTP ${response.status}: ${data?.error || text.slice(0, 200)}`);
+  }
+  return data;
+}
+
+function countReservations(data: any): string {
+  if (Array.isArray(data?.reservations)) return String(data.reservations.length);
+  if (Array.isArray(data)) return String(data.length);
+  return 'data';
+}
+
+function writeEvdekimiFileCache(data: any) {
+  try {
+    fs.mkdirSync(path.dirname(BOOKINGS_DB_PATH), { recursive: true });
+    fs.writeFileSync(BOOKINGS_DB_PATH, JSON.stringify({ lastUpdated: new Date().toISOString(), data }, null, 2));
+  } catch (err: any) {
+    // A read-only or full filesystem must not lose the payload we just got -
+    // the memory cache still serves it.
+    console.warn('Could not write the Evdekimi file cache:', err.message);
+  }
+}
+
+/** Fetches once and shares the result with concurrent callers, updating both
+ *  caches on success. */
+function fetchEvdekimiShared(): Promise<any> {
+  if (evdekimiInFlight) return evdekimiInFlight;
+  evdekimiInFlight = fetchEvdekimiFromApi()
+    .then((data) => {
+      evdekimiMemoryCache = { fetchedAt: Date.now(), data };
+      writeEvdekimiFileCache(data);
+      return data;
+    })
+    .finally(() => {
+      evdekimiInFlight = null;
+    });
+  return evdekimiInFlight;
+}
+
+/** Reservations for the API route: fresh memory copy, then this instance's
+ *  file cache, then the upstream API. Only a missing key leaves nothing to
+ *  return. */
+async function getEvdekimiReservations(): Promise<{ data: any; source: string }> {
+  if (evdekimiMemoryCache && Date.now() - evdekimiMemoryCache.fetchedAt < EVDEKIMI_CACHE_TTL_MS) {
+    return { data: evdekimiMemoryCache.data, source: 'memory' };
+  }
+
+  if (fs.existsSync(BOOKINGS_DB_PATH)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(BOOKINGS_DB_PATH, 'utf-8'));
+      const age = Date.now() - new Date(parsed.lastUpdated || 0).getTime();
+      if (parsed?.data && age < EVDEKIMI_CACHE_TTL_MS) {
+        evdekimiMemoryCache = { fetchedAt: Date.now() - age, data: parsed.data };
+        return { data: parsed.data, source: 'file' };
+      }
+      // Stale on disk: try the API, but keep this as the fallback if it fails.
+      try {
+        return { data: await fetchEvdekimiShared(), source: 'api' };
+      } catch (err: any) {
+        console.warn('Evdekimi API refetch failed, serving the stale file cache:', err.message);
+        return { data: parsed.data, source: 'file (stale)' };
+      }
+    } catch (err: any) {
+      console.warn('Could not read the Evdekimi file cache:', err.message);
+    }
+  }
+
+  return { data: await fetchEvdekimiShared(), source: 'api' };
+}
+
 async function syncEvdekimiBookings() {
   console.log('Starting scheduled Evdekimi API sync...');
+  if (!process.env.EVDEKIMI_API_KEY) {
+    console.warn('No Evdekimi API key available, skipping sync.');
+    return;
+  }
   try {
-    const apiKey = process.env.EVDEKIMI_API_KEY;
-    if (!apiKey) {
-      console.warn('No Evdekimi API key available, skipping sync.');
-      return;
-    }
-    
-    // Fetch a generous range: 6 months past, 1 year future
-    const now = new Date();
-    const pad = (n) => String(n).padStart(2, '0');
-    
-    const fromDateObj = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-    const toDateObj = new Date(now.getFullYear(), now.getMonth() + 4, 0);
-    
-    const fromDate = `${fromDateObj.getFullYear()}-${pad(fromDateObj.getMonth() + 1)}-01`;
-    const toDate = `${toDateObj.getFullYear()}-${pad(toDateObj.getMonth() + 1)}-${pad(toDateObj.getDate())}`;
-
-    const url = `https://evdekimi.hospara.workers.dev/v1/reservations?from=${fromDate}&to=${toDate}`;
-    const response = await fetch(url, {
-      headers: { 'Authorization': `Bearer ${apiKey}` }
-    });
-    
-    const text = await response.text();
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch (e) {
-      console.error('Invalid JSON from Evdekimi API during sync:', text.substring(0, 100));
-      return;
-    }
-
-    if (!response.ok) {
-      console.error('Evdekimi API sync failed:', data.error || 'Unknown error');
-      return;
-    }
-    
-    if (!fs.existsSync(path.dirname(BOOKINGS_DB_PATH))) {
-      fs.mkdirSync(path.dirname(BOOKINGS_DB_PATH), { recursive: true });
-    }
-    
-    fs.writeFileSync(BOOKINGS_DB_PATH, JSON.stringify({
-      lastUpdated: new Date().toISOString(),
-      data: data
-    }, null, 2));
-    
-    console.log(`Evdekimi API sync complete. Saved ${Array.isArray(data?.reservations) ? data.reservations.length : (Array.isArray(data) ? data.length : 'data')} reservations.`);
-  } catch (err) {
-    console.error('Error during scheduled Evdekimi API sync:', err);
+    const data = await fetchEvdekimiShared();
+    console.log(`Evdekimi API sync complete. Saved ${countReservations(data)} reservations.`);
+  } catch (err: any) {
+    console.error('Error during scheduled Evdekimi API sync:', err.message);
   }
 }
 
@@ -2023,17 +2103,17 @@ async function startServer() {
 
   app.get('/api/evdekimi/reservations', async (req, res) => {
     try {
-      if (fs.existsSync(BOOKINGS_DB_PATH)) {
-        const fileContent = fs.readFileSync(BOOKINGS_DB_PATH, 'utf-8');
-        const parsed = JSON.parse(fileContent);
-        return res.json(parsed.data);
-      }
-      
-      // Fallback if not fetched yet
-      return res.status(503).json({ error: "Bookings database is currently synchronizing. Please try again in a moment." });
-    } catch (error) {
-      console.error('Evdekimi local DB error:', error);
-      res.status(500).json({ error: error.message });
+      const { data, source } = await getEvdekimiReservations();
+      res.setHeader('X-Bookings-Source', source);
+      return res.json(data);
+    } catch (error: any) {
+      console.error('Evdekimi reservations unavailable:', error.message);
+      const missingKey = /EVDEKIMI_API_KEY/.test(error.message || '');
+      return res.status(missingKey ? 500 : 503).json({
+        error: missingKey
+          ? 'Booking sync is not configured on the server (EVDEKIMI_API_KEY is missing).'
+          : `Bookings are temporarily unavailable: ${error.message}`,
+      });
     }
   });
 
