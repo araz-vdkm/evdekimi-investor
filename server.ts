@@ -547,8 +547,24 @@ function parsePlatformAdminEmails(): string[] {
 
 const PLATFORM_ADMIN_EMAILS = parsePlatformAdminEmails();
 
-function isPlatformAdminEmail(email?: string | null): boolean {
-  const normalized = String(email || '').toLowerCase().trim();
+/**
+ * True when `value` identifies a platform admin, per PLATFORM_ADMIN_EMAILS.
+ *
+ * The env var is named for emails (and keeps that name so deployed configs
+ * keep working), but an entry may be any identifier the Investors sheet
+ * carries for an account: an email, the login in the user column, or an
+ * investor code. Sign-in accepts a login OR an investor code
+ * (findInvestorByUsernamePassword matches both), so the admin check has to
+ * look at the same fields or an account can sign in yet not be recognised.
+ *
+ * Matching is on the WHOLE field, never on part of it. That matters for the
+ * code column, which can hold several comma-separated codes: an entry of
+ * "7777777" grants admin to an account whose code field is exactly that, and
+ * not to one whose field merely contains it (e.g. "VA86IE, 7777777"), so a
+ * shared code appearing in other investors' rows cannot escalate them.
+ */
+function isPlatformAdminIdentifier(value?: string | null): boolean {
+  const normalized = String(value || '').toLowerCase().trim();
   if (!normalized) return false;
   return PLATFORM_ADMIN_EMAILS.includes(normalized);
 }
@@ -560,12 +576,13 @@ function buildAuthUserPayload(
   return {
     username: investor.legacyUsername,
     isAdmin: opts.isAdmin,
-    // Legacy admin/utility accounts often log in with their email *as* the
-    // username, with the sheet's separate Email column left blank — so we
-    // check legacyUsername too (mirrors resolveInvestorIsAdmin's roman@ check).
+    // Utility/admin accounts are identified inconsistently across the sheet:
+    // some log in with an email as the username and leave the Email column
+    // blank, some are known only by an investor code. Check all three.
     isPlatformAdmin:
-      isPlatformAdminEmail(opts.emailOverride || investor.email) ||
-      isPlatformAdminEmail(investor.legacyUsername),
+      isPlatformAdminIdentifier(opts.emailOverride || investor.email) ||
+      isPlatformAdminIdentifier(investor.legacyUsername) ||
+      isPlatformAdminIdentifier(investor.investorCode),
     code: investor.investorCode,
     investorName: investor.investorName,
     email: opts.emailOverride || investor.email,
@@ -1689,7 +1706,7 @@ async function startServer() {
         // to silently strip admin rights on Google link, so every
         // /api/admin/* call started failing while the UI still showed the
         // admin tabs (they come from the client's stored user object).
-        isPlatformAdmin: session.isPlatformAdmin || isPlatformAdminEmail(result.email),
+        isPlatformAdmin: session.isPlatformAdmin || isPlatformAdminIdentifier(result.email),
         googleEmail: result.email,
       }, req);
       res.json({
@@ -1748,9 +1765,10 @@ async function startServer() {
         isAdmin,
         // Same as link-google: recompute rather than drop it (see note there).
         isPlatformAdmin:
-          isPlatformAdminEmail(identity.email) ||
-          isPlatformAdminEmail(investor.email) ||
-          isPlatformAdminEmail(investor.legacyUsername),
+          isPlatformAdminIdentifier(identity.email) ||
+          isPlatformAdminIdentifier(investor.email) ||
+          isPlatformAdminIdentifier(investor.legacyUsername) ||
+          isPlatformAdminIdentifier(investor.investorCode),
         googleEmail: result.email,
       }, req);
 
