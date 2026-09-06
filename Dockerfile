@@ -23,8 +23,12 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/firebase-applet-config.json ./firebase-applet-config.json
-COPY --from=builder /app/data ./data
-RUN chown -R appuser:nodejs /app/data
+
+# data/ holds runtime state (settings, thresholds, the bookings cache) and is
+# deliberately not in version control - it carries real bookings and guest
+# details. The server creates the files it needs on first use, so the image
+# only needs the directory to exist and be writable.
+RUN mkdir -p /app/data && chown -R appuser:nodejs /app/data
 
 USER appuser
 
