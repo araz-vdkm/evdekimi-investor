@@ -563,6 +563,44 @@ const PLATFORM_ADMIN_EMAILS = parsePlatformAdminEmails();
  * not to one whose field merely contains it (e.g. "VA86IE, 7777777"), so a
  * shared code appearing in other investors' rows cannot escalate them.
  */
+/**
+ * One-line-per-setting summary of what this process can actually do, logged
+ * once at startup.
+ *
+ * Every setting here comes from the environment, so the same image behaves
+ * differently locally and on Cloud Run — and when something is missing the
+ * symptom is usually indirect: admin tabs quietly absent, formulas
+ * unreadable, bookings never syncing, a login that 429s. Printing the
+ * resolved state makes a deploy self-explanatory instead of a guess.
+ *
+ * Values are never printed, only whether they are present.
+ */
+function logStartupConfig() {
+  const present = (v?: string) => Boolean(v && v.trim());
+
+  const sheetsViaApi =
+    present(process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL) &&
+    formatPrivateKey(process.env.GOOGLE_PRIVATE_KEY).includes('PRIVATE KEY');
+
+  const sessionSigning = present(process.env.SESSION_SECRET)
+    ? 'SESSION_SECRET'
+    : present(process.env.GOOGLE_PRIVATE_KEY)
+      ? 'derived from GOOGLE_PRIVATE_KEY (works, but set SESSION_SECRET)'
+      : 'DERIVED FROM A CONSTANT IN THE SOURCE — session cookies are forgeable, set SESSION_SECRET';
+
+  const lines = [
+    '--- configuration ---',
+    `  environment        : ${process.env.NODE_ENV || 'development'}`,
+    `  spreadsheet reads  : ${sheetsViaApi ? 'Sheets API via service account (formulas readable)' : 'public CSV export (values only — no formulas, rate-limited)'}`,
+    `  Firestore admin    : ${sheetsViaApi ? 'configured' : 'NOT configured — account links and monthly reports will fail'}`,
+    `  session signing    : ${sessionSigning}`,
+    `  platform admins    : ${PLATFORM_ADMIN_EMAILS.length} configured${PLATFORM_ADMIN_EMAILS.length === 0 ? ' — Cockpit and Accounting will be hidden for everyone' : ''}`,
+    `  Evdekimi API       : ${present(process.env.EVDEKIMI_API_KEY) ? 'configured' : 'NOT configured — booking sync will skip every run'}`,
+    '---------------------',
+  ];
+  console.log(lines.join('\n'));
+}
+
 function isPlatformAdminIdentifier(value?: string | null): boolean {
   const normalized = String(value || '').toLowerCase().trim();
   if (!normalized) return false;
@@ -2015,6 +2053,7 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    logStartupConfig();
   });
 }
 
