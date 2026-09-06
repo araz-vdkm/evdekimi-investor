@@ -79,3 +79,28 @@ export function calculateKPIs(bookings: Booking[], property: Property, daysInMon
     totalReturns
   };
 }
+
+/**
+ * Reads a fetch Response as JSON, tolerating a body that isn't JSON at all.
+ *
+ * Requests can be answered by something between the browser and our server —
+ * Cloud Run's frontend returns a bare "Rate exceeded." for a throttled
+ * request, proxies return HTML error pages. Calling res.json() on those
+ * throws a SyntaxError ("Unexpected token 'R'..."), which surfaces to the
+ * user as a parse error and hides the real problem. This returns the parsed
+ * object when the body is JSON, and otherwise an { error } carrying the
+ * status and whatever text came back, so callers can show something true.
+ */
+export async function readJsonResponse(res: Response): Promise<any> {
+  const text = await res.text().catch(() => '');
+  if (text) {
+    try {
+      return JSON.parse(text);
+    } catch {
+      const snippet = text.trim().slice(0, 200);
+      if (res.ok) return { error: `Unexpected non-JSON response (${res.status})` };
+      return { error: snippet || `Request failed (${res.status})` };
+    }
+  }
+  return res.ok ? {} : { error: `Request failed (${res.status})` };
+}

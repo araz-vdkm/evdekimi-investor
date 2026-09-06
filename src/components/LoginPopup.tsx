@@ -4,6 +4,7 @@ import { LogIn, AlertCircle } from 'lucide-react';
 import { useAuth } from './AuthProvider';
 import { EvdekimiLogo } from './EvdekimiLogo';
 import { auth, googleIdentityProvider } from '../lib/firebase';
+import { readJsonResponse } from '../lib/utils';
 import { signInWithPopup, OAuthProvider } from 'firebase/auth';
 
 export function LoginPopup() {
@@ -32,7 +33,7 @@ export function LoginPopup() {
         body: JSON.stringify({ username, password })
       });
       
-      const data = await res.json();
+      const data = await readJsonResponse(res);
       
       if (!res.ok) {
         throw new Error(data.error || 'Login failed');
@@ -64,7 +65,7 @@ export function LoginPopup() {
           legacyPassword: linkLegacyPassword
         })
       });
-      const data = await res.json();
+      const data = await readJsonResponse(res);
       if (!res.ok) throw new Error(data.error || 'Invalid credentials');
 
       const result = await signInWithPopup(auth, googleIdentityProvider);
@@ -119,7 +120,7 @@ export function LoginPopup() {
         body: JSON.stringify({ firebaseIdToken: await result.user.getIdToken() })
       });
       
-      const data = await res.json();
+      const data = await readJsonResponse(res);
       if (!res.ok) throw new Error(data.error || 'Please link your account first');
       login(data.user);
     } catch (err: any) {
@@ -145,7 +146,7 @@ export function LoginPopup() {
         body: JSON.stringify({ firebaseIdToken })
       });
 
-      const data = await res.json();
+      const data = await readJsonResponse(res);
       if (!res.ok) {
         throw new Error(data.error || 'This Google account is not linked to an EVDEKIMI account. Please log in with your EVDEKIMI credentials and connect Google from your profile first.');
       }
