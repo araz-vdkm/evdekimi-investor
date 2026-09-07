@@ -45,7 +45,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { PROPERTIES } from './data';
 import { Property, Booking, Currency, GuestySyncStatus } from './types';
 import { guestyApi } from './lib/guesty';
-import { formatCurrency, calculateKPIs } from './lib/utils';
+import { formatCurrency, calculateKPIs, readJsonResponse } from './lib/utils';
 import { useAuth } from './components/AuthProvider';
 import { ChatBox } from './components/ChatBox';
 import { LoginPopup } from './components/LoginPopup';
@@ -485,7 +485,17 @@ export default function App() {
       const fromDate = `${fromDateObj.getFullYear()}-${pad(fromDateObj.getMonth() + 1)}-01`;
       const toDate = `${toDateObj.getFullYear()}-${pad(toDateObj.getMonth() + 1)}-${pad(toDateObj.getDate())}`;
       const evdekimiReq = fetch(`/api/evdekimi/reservations?from=${fromDate}&to=${toDate}`).then(r => r.ok ? r.json() : null).catch(() => null);
-      const settingsReq = fetch('/api/admin/settings', { credentials: 'include' }).then(r => r.ok ? r.json() : {}).catch(() => ({}));
+      // A failed settings fetch must not read as "the admin cleared every
+      // per-month source". Absence of an answer and an empty answer are
+      // different things: the first means keep what we already have, the
+      // second means the admin really has no overrides. Collapsing both to {}
+      // made every explicit choice disappear on the next 5-minute sync, and a
+      // past month then fell back to SHEETS.
+      const settingsReq: Promise<{ ok: boolean; settings?: Record<string, any> }> = fetch('/api/admin/settings', {
+        credentials: 'include',
+      })
+        .then(async (r) => (r.ok ? { ok: true, settings: await readJsonResponse(r) } : { ok: false }))
+        .catch(() => ({ ok: false }));
 
       const [bookingsRows, summaryRows, expensesRows, villasRows, currencyRows, listingsRows, evdekimiData, settingsData] = await Promise.all([
         fetchSheet('Bookings'),
@@ -645,7 +655,11 @@ export default function App() {
       setSummaries(parsedSummaries);
       setExpenses(parsedExpenses);
       setCurrencyData(parsedCurrency);
-      setAppSettings(settingsData || {});
+      if (settingsData?.ok) {
+        setAppSettings(settingsData.settings || {});
+      } else {
+        console.warn('Keeping the current data-source settings: the server did not return them.');
+      }
 
       setSyncStatus({
         lastSync: new Date().toLocaleTimeString(),
