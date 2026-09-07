@@ -1446,6 +1446,130 @@ function readSettingsFile(settingsPath: string): Record<string, string | boolean
   }
 }
 
+// ---------------------------------------------------------------------------
+// Shared settings storage
+//
+// These settings used to live only in data/app-settings.json. On Cloud Run
+// that file belongs to one instance and is discarded on every deploy, so a
+// save could land on one instance and a later read miss it entirely - the
+// admin's per-month source choice appeared to revert on its own.
+//
+// Firestore is now the source of truth, with the file kept as a local mirror.
+// The rules here are deliberately conservative, because the dashboard must
+// keep working when Firestore does not:
+//   - reads fall back to the file on ANY failure, so behaviour degrades to
+//     exactly what it was before this change, never to an error;
+//   - every call is bounded by a timeout, because a hanging read would stall
+//     the client's 5-minute sync (it awaits this alongside the sheet fetches);
+//   - writes always update the file, so a save is never lost locally, and
+//     report whether it reached shared storage.
+// ---------------------------------------------------------------------------
+
+const SETTINGS_COLLECTION = 'app_settings';
+const SETTINGS_DOC = 'month_sources';
+
+/** A Firestore call must never outlast this. Kept short: the settings read
+ *  sits on the critical path of every dashboard sync. */
+const FIRESTORE_TIMEOUT_MS = 4000;
+
+function isFirestoreConfigured(): boolean {
+  return (
+    Boolean(process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL) &&
+    formatPrivateKey(process.env.GOOGLE_PRIVATE_KEY).includes('PRIVATE KEY')
+  );
+}
+
+async function withTimeout<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expiry = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([work, expiry]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Returns the document's data, or null when the document does not exist.
+ *  Throws when Firestore is unreachable - callers decide how to degrade. */
+async function firestoreReadDoc(collection: string, docId: string): Promise<Record<string, any> | null> {
+  const snap = await withTimeout(
+    getAdminDb().collection(collection).doc(docId).get(),
+    FIRESTORE_TIMEOUT_MS,
+    `Firestore read ${collection}/${docId}`
+  );
+  return snap.exists ? (snap.data() || {}) : null;
+}
+
+async function firestoreWriteDoc(collection: string, docId: string, data: Record<string, any>): Promise<void> {
+  await withTimeout(
+    getAdminDb().collection(collection).doc(docId).set(data),
+    FIRESTORE_TIMEOUT_MS,
+    `Firestore write ${collection}/${docId}`
+  );
+}
+
+/** Month-source settings, preferring shared storage.
+ *
+ *  When Firestore has no document yet, whatever the local file holds is
+ *  copied up once, so an existing deployment keeps the choices it already had
+ *  instead of silently resetting to the defaults on the first read. */
+async function readSettings(settingsPath: string): Promise<{ settings: Record<string, any>; origin: string }> {
+  if (isFirestoreConfigured()) {
+    try {
+      const doc = await firestoreReadDoc(SETTINGS_COLLECTION, SETTINGS_DOC);
+      if (doc) return { settings: doc, origin: 'firestore' };
+
+      const fromFile = readSettingsFile(settingsPath);
+      if (Object.keys(fromFile).length > 0) {
+        try {
+          await firestoreWriteDoc(SETTINGS_COLLECTION, SETTINGS_DOC, fromFile);
+          console.log(`Seeded ${SETTINGS_COLLECTION}/${SETTINGS_DOC} from the local settings file.`);
+          return { settings: fromFile, origin: 'firestore (seeded from file)' };
+        } catch (err: any) {
+          console.warn('Could not seed settings into Firestore:', err.message);
+        }
+      }
+      return { settings: fromFile, origin: 'file (Firestore empty)' };
+    } catch (err: any) {
+      console.warn('Firestore settings read failed, falling back to the local file:', err.message);
+    }
+  }
+  return { settings: readSettingsFile(settingsPath), origin: 'file' };
+}
+
+/** Persists settings. The file is always written so a save is never lost on
+ *  this instance; the returned value says whether shared storage took it. */
+async function writeSettings(
+  settingsPath: string,
+  updated: Record<string, any>
+): Promise<{ persisted: 'firestore' | 'file-only'; warning?: string }> {
+  try {
+    fs.writeFileSync(settingsPath, JSON.stringify(updated, null, 2));
+  } catch (err: any) {
+    console.warn('Could not write the local settings mirror:', err.message);
+  }
+
+  if (!isFirestoreConfigured()) {
+    return {
+      persisted: 'file-only',
+      warning: 'Saved on this server only - Firestore is not configured, so the choice will not survive a redeploy.',
+    };
+  }
+
+  try {
+    await firestoreWriteDoc(SETTINGS_COLLECTION, SETTINGS_DOC, updated);
+    return { persisted: 'firestore' };
+  } catch (err: any) {
+    console.error('Firestore settings write failed:', err.message);
+    return {
+      persisted: 'file-only',
+      warning: `Saved on this server only - shared storage rejected the write (${err.message}).`,
+    };
+  }
+}
+
 function validateSettingsBody(body: unknown): Record<string, 'SHEETS' | 'API' | 'FIREBASE'> {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     const err: any = new Error('Settings body must be a JSON object');
@@ -1987,23 +2111,32 @@ async function startServer() {
     settingsPath = resolveSettingsPath();
   }
 
-  app.get('/api/admin/settings', (req, res) => {
+  // Left readable by any signed-in user on purpose: an investor's dashboard
+  // needs the per-month source to pick the right bookings, so gating this
+  // would change what they see, not just what they may change.
+  app.get('/api/admin/settings', async (req, res) => {
     try {
-      res.json(readSettingsFile(settingsPath));
+      const { settings } = await readSettings(settingsPath);
+      res.json(settings);
     } catch (e: any) {
       console.error('admin settings read error:', e);
       res.status(500).json({ error: 'Failed to read settings' });
     }
   });
 
-  app.post('/api/admin/settings', (req, res) => {
+  app.post('/api/admin/settings', async (req, res) => {
+    // The source switcher is admin-only in the UI, but this endpoint used to
+    // accept a write from anyone - and it decides which figures every
+    // investor sees.
+    if (!requireAdminSession(req, res)) return;
     try {
       settingsPath = ensureSettingsStore();
-      const current = readSettingsFile(settingsPath);
+      const { settings: current } = await readSettings(settingsPath);
       const incoming = validateSettingsBody(req.body);
       const updated = { ...current, ...incoming };
-      fs.writeFileSync(settingsPath, JSON.stringify(updated, null, 2));
-      res.json({ success: true, settings: updated });
+      const { persisted, warning } = await writeSettings(settingsPath, updated);
+      if (warning) console.warn('admin settings save:', warning);
+      res.json({ success: true, settings: updated, persisted, ...(warning ? { warning } : {}) });
     } catch (e: any) {
       console.error('admin settings save error:', e);
       res.status(e.status || 500).json({ error: e.message || 'Failed to save settings' });
