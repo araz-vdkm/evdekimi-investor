@@ -163,6 +163,10 @@ export default function App() {
   const [isSourceMenuOpen, setIsSourceMenuOpen] = useState(false);
   const syncGenerationRef = useRef(0);
   const isSourceSwitchingRef = useRef(false);
+  /** Latest appSettings, readable from handleSync. The interval created in the
+   *  mount effect closes over the appSettings of that render, so reading state
+   *  directly there can be stale by hours. */
+  const appSettingsRef = useRef<Record<string, any>>({});
   const sourceDropdownRef = useRef<HTMLDivElement>(null);
 
 
@@ -508,6 +512,16 @@ export default function App() {
         settingsReq
       ]);
 
+      // The settings fetch reports success separately from its payload, so
+      // resolve it once here: on success use what the server sent, otherwise
+      // keep what we already have. Everything below reads this - the source
+      // filters as well as the state update - because reading the raw
+      // response shape in one place and the wrapper in another is exactly how
+      // the August-set-to-API selection silently stopped applying.
+      const resolvedSettings: Record<string, any> = settingsData?.ok
+        ? (settingsData.settings || {})
+        : appSettingsRef.current;
+
 
       // Parse Villas (title row + description row aware — same layout as Investors sheet)
       const parsedVillas = parseVillaSheetRows(villasRows);
@@ -602,7 +616,7 @@ export default function App() {
           const k = calendarMonthKey(b.checkInDate);
           if (!k) return false;
           const currentViewSource = resolveReservationSource(
-            settingsData?.[k],
+            resolvedSettings[k],
             isPastMonthKey(k, currentYear, currentMonth)
           );
           return currentViewSource === 'SHEETS';
@@ -614,7 +628,7 @@ export default function App() {
             const k = calendarMonthKey(r.checkIn);
             if (!k) return false;
             const currentViewSource = resolveReservationSource(
-              settingsData?.[k],
+              resolvedSettings[k],
               isPastMonthKey(k, currentYear, currentMonth)
             );
             return currentViewSource !== 'SHEETS'; // Use API if not forced to Sheets (includes FIREBASE)
@@ -655,11 +669,11 @@ export default function App() {
       setSummaries(parsedSummaries);
       setExpenses(parsedExpenses);
       setCurrencyData(parsedCurrency);
-      if (settingsData?.ok) {
-        setAppSettings(settingsData.settings || {});
-      } else {
+      if (!settingsData?.ok) {
         console.warn('Keeping the current data-source settings: the server did not return them.');
       }
+      appSettingsRef.current = resolvedSettings;
+      setAppSettings(resolvedSettings);
 
       setSyncStatus({
         lastSync: new Date().toLocaleTimeString(),
@@ -674,6 +688,10 @@ export default function App() {
       return false;
     }
   };
+
+  useEffect(() => {
+    appSettingsRef.current = appSettings;
+  }, [appSettings]);
 
   useEffect(() => {
     if (user) {
@@ -704,6 +722,9 @@ export default function App() {
 
     const previousSettings = appSettings;
     const newSettings = { ...appSettings, [key]: nextSource };
+    // Set the ref synchronously: handleSync runs a few lines below and must
+    // not see the pre-switch settings if the fetch it makes happens to fail.
+    appSettingsRef.current = newSettings;
     const gen = ++syncGenerationRef.current;
     isSourceSwitchingRef.current = true;
     setAppSettings(newSettings);
@@ -721,6 +742,7 @@ export default function App() {
       await handleSync({ fromSourceSwitch: true, gen });
     } catch (err: any) {
       if (syncGenerationRef.current === gen) {
+        appSettingsRef.current = previousSettings;
         setAppSettings(previousSettings);
         setSyncStatus(prev => ({ ...prev, status: 'error', error: err?.message || 'Source switch failed' }));
       }
